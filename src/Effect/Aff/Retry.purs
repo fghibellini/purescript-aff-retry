@@ -23,15 +23,18 @@ import Prelude
 import Control.Bind (bindFlipped)
 import Control.Monad.Error.Class (class MonadError)
 import Control.Monad.Maybe.Trans (MaybeT(..), runMaybeT)
-import Data.Array (uncons)
-import Data.Either (either)
+import Data.Array (uncons, (:))
+import Data.Either (Either(..), either)
 import Data.Int (toNumber)
+import Data.JSDate (now, getTime)
 import Data.Maybe (Maybe(Nothing, Just), maybe)
 import Data.Newtype (class Newtype, unwrap)
+import Data.Time (Millisecond)
 import Data.Time.Duration (class Duration, Milliseconds(..), fromDuration)
+import Data.Tuple (Tuple(..), snd)
 import Effect.Aff (delay, throwError, try)
 import Effect.Aff.Class (class MonadAff, liftAff)
-import Effect.Class (liftEffect)
+import Effect.Class (class MonadEffect, liftEffect)
 import Effect.Exception (Error)
 import Effect.Random (randomRange)
 import Math (pow)
@@ -217,29 +220,38 @@ applyAndDelay policy retryStatus = do
           $> Just nextRetryStatus
       Nothing -> pure Nothing
 
+type Config m =
+  { policy :: RetryPolicyM m
+  , resetTimeout :: Maybe Milliseconds -- if an action takes longer this amount of time, the retry state will be reset
+                                       -- this is useful for operations that are not supposed to ever terminate, and thus a long
+                                       -- operation time is considered a success. k8s uses 10 minutes in this context
+  }
 
 -- | Retry combinator for actions that don't raise exceptions, but
 -- | signal in their type the outcome has failed. Examples are the
 -- | 'Maybe', 'Either' and 'EitherT' monads.
 retrying :: ∀ m b . MonadAff m
-  => RetryPolicyM m
+  => Config m
   -> (RetryStatus -> b -> m Boolean) -- An action to check whether the result should be retried.
                                      -- If True, we delay and retry the operation.
   -> (RetryStatus -> m b)            -- Action to run
   -> m b
-retrying policy check action = go defaultRetryStatus
+retrying cfg check action = go defaultRetryStatus
   where
   go status = do
-    res <- action status
-    ifM (check status res)
-      (applyAndDelay policy status >>= maybe (pure res) go)
+    Tuple res duration <- runTimedAction (action status)
+    let
+      shouldReset = maybe false (duration > _) cfg.resetTimeout
+      status' = if shouldReset then defaultRetryStatus else status
+    ifM (check status res) -- TODO do we want to pass the status from the old or new cycle ?
+      (applyAndDelay cfg.policy status' >>= maybe (pure res) go)
       (pure res)
 
 -- | Run an action and recover from a raised exception by potentially
 -- | retrying the action a number of times.
 recovering :: ∀ m a . MonadAff m
   => MonadError Error m
-  => RetryPolicyM m
+  => Config m
   -> Array (RetryStatus -> Error -> m Boolean)
   -- ^ Should a given exception be retried? Action will be
   -- retried if this returns True *and* the policy allows it.
@@ -247,12 +259,31 @@ recovering :: ∀ m a . MonadAff m
   -- later blocks it.
   -> (RetryStatus -> m a) -- Action to perform
   -> m a
-recovering policy checks f = go defaultRetryStatus
+recovering cfg checks f = go defaultRetryStatus
   where
-  go status = try (f status) >>= either (recover checks) pure
-    where
-    recover chks e = uncons chks # maybe (throwError e) (handle e)
-    handle e hs =
-      ifM (hs.head status e)
-        (applyAndDelay policy status >>= maybe (throwError e) go)
-        (recover hs.tail e)
+  go status = do
+    Tuple res duration <- runTimedAction $ try (f status)
+    let
+      shouldReset = maybe false (duration > _) cfg.resetTimeout
+      status' = if shouldReset then defaultRetryStatus else status
+    case res of
+      Right x -> pure x
+      Left e -> ifM (applyHandlerChain checks status' e)
+        (applyAndDelay cfg.policy status' >>= maybe (throwError e) go)
+        (throwError e)
+
+applyHandlerChain :: forall m . Monad m => Array (RetryStatus -> Error -> m Boolean) -> RetryStatus -> Error -> m Boolean
+applyHandlerChain checks status e = case uncons checks of
+  Nothing -> pure false
+  Just { head: check, tail: checkTail } -> do
+      ifM (check status e)
+        (pure true)
+        (applyHandlerChain checkTail status e)
+
+runTimedAction :: forall m a . MonadEffect m =>  m a -> m (Tuple a Milliseconds)
+runTimedAction action = do
+    t0 <- liftEffect now
+    res <- action
+    t1 <- liftEffect now
+    let duration = Milliseconds (getTime t1 - getTime t0)
+    pure (Tuple res duration)

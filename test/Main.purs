@@ -8,12 +8,13 @@ import Data.Foldable (sum)
 import Data.Maybe (Maybe(..), isNothing, maybe)
 import Data.Tuple (snd)
 import Effect (Effect)
-import Effect.Aff (Aff, Milliseconds(..), attempt, throwError)
+import Effect.Aff (Aff, Milliseconds(..), attempt, delay, error, throwError)
 import Effect.Aff.AVar (AVar, new, put, take)
 import Effect.Aff.Retry (RetryPolicyM, RetryStatus(RetryStatus), applyPolicy, constantDelay, defaultRetryStatus, limitRetries, limitRetriesByCumulativeDelay, recovering, retryPolicy, retrying)
 import Effect.Class (liftEffect)
 import Effect.Console (log)
 import Effect.Exception (error, Error)
+import Effect.Ref as Ref
 import Test.Retry (simulatePolicy)
 import Test.Unit (failure, suite, test)
 import Test.Unit.Assert (assert, equal, shouldEqual)
@@ -51,7 +52,7 @@ main = runTest do
           for3seconds = constantDelay (Milliseconds 200.0)
                      <> limitRetries 3
 
-      result <- retrying for3seconds check action
+      result <- retrying { policy: for3seconds, resetTimeout: Nothing } check action
       assert "Nothing expected" $ isNothing result
 
   suite "recovering action" do
@@ -75,7 +76,7 @@ main = runTest do
       let lastIteration = 2
           checks :: Array (RetryStatus -> Error -> Aff Boolean)
           checks = pure \(RetryStatus rs) -> const $ pure (rs.iterNumber /= lastIteration)
-      result <- attempt $ recovering myRetryPolicy checks (recoveringAction actionRuns)
+      result <- attempt $ recovering { policy: myRetryPolicy, resetTimeout: Nothing } checks (recoveringAction actionRuns)
       assert "Failure expected" $ isLeft result
       take actionRuns >>= equal (one + lastIteration)
 
@@ -83,7 +84,7 @@ main = runTest do
       actionRuns <- new zero
       let checks :: Array (RetryStatus -> Error -> Aff Boolean)
           checks = [ (pure >>> pure >>> pure) false, (pure >>> pure >>> pure) true ]
-      result <- attempt $ recovering myRetryPolicy checks (recoveringAction actionRuns)
+      result <- attempt $ recovering { policy: myRetryPolicy, resetTimeout: Nothing } checks (recoveringAction actionRuns)
       assert "Failure expected" $ isLeft result
       take actionRuns >>= equal (one + expectedRetries)
 
@@ -91,13 +92,12 @@ main = runTest do
       actionRuns <- new zero
       let checks :: Array (RetryStatus -> Error-> Aff Boolean)
           checks = [ (pure >>> pure >>> pure) true ]
-      result <- attempt $ recovering myRetryPolicy checks (recoveringAction actionRuns)
+      result <- attempt $ recovering { policy: myRetryPolicy, resetTimeout: Nothing } checks (recoveringAction actionRuns)
       assert "Failure expected" $ isLeft result
       take actionRuns >>= equal (one + expectedRetries)
 
     test "cumulative delays don't exceed given limit" do
-      let baseDelay = Milliseconds 90.0
-          cumulativeDelayMax = Milliseconds 30.0
+      let cumulativeDelayMax = Milliseconds 30.0
           policy = limitRetriesByCumulativeDelay cumulativeDelayMax myRetryPolicy
       results <- simulatePolicy 100 policy
       let delays = A.catMaybes (snd <$> results)
@@ -105,3 +105,23 @@ main = runTest do
             Milliseconds $ sum ((\(Milliseconds ms) -> ms) <$> delays)
       assert "Actual cumulative delay is less than max delay"
         (actualCumulativeDelay <= cumulativeDelayMax)
+
+    test "An action that will run for longer than `resetTimeout` will be retried with a fresh retry state" do
+      n <- liftEffect $ Ref.new 0
+      iterCounts <- liftEffect $ Ref.new []
+      let
+        lastIteration = 5
+        check :: RetryStatus -> Error -> Aff Boolean
+        check (RetryStatus rs) _ = do
+          _ <- liftEffect $ Ref.modify (_ <> [rs.iterNumber]) iterCounts
+          totalIterationCount <- liftEffect $ Ref.read n
+          pure (totalIterationCount /= lastIteration)
+        action :: RetryStatus -> Aff Unit
+        action _ = do
+          i <- liftEffect $ Ref.read n
+          delay $ if i < 3 then (Milliseconds 10.0) else (Milliseconds 500.0)
+          _ <- liftEffect $ Ref.modify (_ + 1) n
+          throwError $ error "something went wrong"
+      result <- attempt $ recovering { policy: myRetryPolicy, resetTimeout: Just (Milliseconds 300.0) } [check] action
+      assert "Failure expected" $ isLeft result
+      liftEffect (Ref.read iterCounts) >>= equal [0,1,2,0,0]

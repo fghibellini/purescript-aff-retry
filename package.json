@@ -1,0 +1,26 @@
+{
+  "name": "purescript-aff-retry",
+  "version": "1.0.0",
+  "description": "(Purescript port of Haskell's [retry](https://github.com/Soostone/retry) package)",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Unisay/purescript-aff-retry.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Unisay/purescript-aff-retry/issues"
+  },
+  "homepage": "https://github.com/Unisay/purescript-aff-retry#readme",
+  "devDependencies": {
+    "purescript": "^0.14.5",
+    "spago": "^0.20.3"
+  }
+}
